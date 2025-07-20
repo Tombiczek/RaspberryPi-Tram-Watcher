@@ -1,0 +1,8 @@
+# Wirtualne środowisko
+venv/
+.venv/
+env/
+ENV/
+
+# Zmienne środowiskowe
+.env
