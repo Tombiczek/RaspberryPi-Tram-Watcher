@@ -1,161 +1,143 @@
-"""tram_board.py
-================
-Wyświetla najbliższe odjazdy tramwajów dla wybranych linii na ekranie e-paper
-(lub w pliku PNG). Kod jest maksymalnie skrócony i udokumentowany, żeby po
-kilku miesiącach można było z marszu zrozumieć, co się dzieje.
-"""
-
 from __future__ import annotations
 
-import logging
 import os
-from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import List, Tuple
 
 import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
-# ---------------------------------------------------------------------------
+API_URL: str = "https://api.um.warszawa.pl/api/action/dbtimetable_get"
+FONT_PATH: str = "/System/Library/Fonts/SFNS.ttf"
+OUTPUT_FILE: Path = Path("tram_board.png")
+IMG_SIZE = (648, 480)
+FONT_SIZE = 15
+
+MODE: str = os.getenv("TRAM_MODE", "debug").lower()
+
+STOP_CONFIGS: list[dict] = [
+    {
+        "label": "Rondo",      # etykieta na ekranie
+        "id": "5040",         # id słupka ZTM
+        "nr": "07",           # nr przystanku
+        "lines": ["10", "11"],
+        "horizon": 60,        # ile minut naprzód szukamy
+        "walk": 5,           # czas dojścia na słupek (min)
+        "hide_before": 3,     # kurs znika, gdy zostało ≤ N min
+    },
+]
+
+
 load_dotenv()
 API_KEY: str | None = os.getenv("API_KEY")
 if not API_KEY:
-    raise RuntimeError("Brak klucza API")
-timeout = 4  # s – domyślny timeout dla requestów HTTP
-API_ENDPOINT = "https://api.um.warszawa.pl/api/action/dbtimetable_get"
-TIME_API = "http://worldtimeapi.org/api/timezone/Europe/Warsaw"
-FONT_PATH = "/System/Library/Fonts/SFNS.ttf"
-OUTPUT_FILE = Path("tramwaje_output.png")
-WATCHED_LINES = ("10", "11")
+    API_KEY = ""
 
 
-# ---------------------------------------------------------------------------
-# Konfiguracja logowania
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-
-@dataclass(frozen=True)
-class Stop:
-    """Reprezentuje przystanek ZTM."""
-
-    id: str
-    number: str
-
-
-STOP = Stop(id="5040", number="07")
-
-
-# ---------------------------------------------------------------------------
-# Funkcje pomocnicze
-
-def now(tz_source: str = TIME_API) -> datetime:
-    """Zwraca aktualny czas w strefie *Europe/Warsaw*.
-
-    Gdy zewnętrzne API jest niedostępne, korzysta z zegara systemowego.
-    """
-    try:
-        resp = requests.get(tz_source, timeout=2)
-        resp.raise_for_status()
-        return datetime.fromisoformat(resp.json()["datetime"])
-    except Exception as exc:  # pragma: no cover – odpuszczamy testowanie sieci
-        logging.warning("WorldTime API unavailable (%s). Falling back to local clock.", exc)
-        return datetime.now()
-
-
-def departures_for(
-    line: str,
-    *,
-    stop: Stop = STOP,
-    api_key: str = API_KEY,
-) -> list[tuple[str, str, str]]:
-    """Pobiera surowe odjazdy linii *line* na przystanku *stop*.
-
-    Każdy rekord to ("HH:MM:SS", kierunek, linia).
-    """
+def fetch(stop_id: str, stop_nr: str, line: str) -> List[Tuple[datetime, str, str]] | str:
+    """Zwraca listę (datetime, line, kierunek) lub tekst błędu."""
     params = {
         "id": "e923fa0e-d96c-43f9-ae6e-60518c9f3238",
-        "busstopId": stop.id,
-        "busstopNr": stop.number,
+        "busstopId": stop_id,
+        "busstopNr": stop_nr,
         "line": line,
-        "apikey": api_key,
+        "apikey": API_KEY,
     }
-    result = requests.get(API_ENDPOINT, params=params, timeout=timeout).json().get("result", [])
-    if isinstance(result, str):
-        logging.error("API error for line %s: %s", line, result)
-        return []
+    try:
+        data = requests.get(API_URL, params=params, timeout=4).json().get("result", [])
+    except Exception as exc:
+        return f"Błąd sieci {line}@{stop_nr}: {exc}"
+    if isinstance(data, str):
+        return f"Błąd API {line}@{stop_nr}: {data}"
 
-    parsed: list[tuple[str, str, str]] = []
-    for entry in result:
-        record = {itm["key"]: itm["value"] for itm in entry}
-        if record.get("czas") and record.get("kierunek"):
-            parsed.append((record["czas"], record["kierunek"], line))
-    return parsed
+    today = datetime.now().date()
+    deps: list[Tuple[datetime, str, str]] = []
+    for entry in data:
+        rec = {i["key"]: i["value"] for i in entry}
+        if "czas" in rec and "kierunek" in rec:
+            hh, mm, ss = map(int, rec["czas"].split(":"))
+            deps.append((datetime.combine(today, time(hh, mm, ss)), line, rec["kierunek"]))
+    return deps or f"Brak danych {line}@{stop_nr}"
 
 
-def next_departures(
-    raw: Iterable[tuple[str, str, str]],
-    *,
-    current: datetime,
-    limit: int = 10,
-) -> list[tuple[datetime, str, str, int]]:
-    """Filtruje i porządkuje listę odjazdów.
-
-    Zwraca maksymalnie *limit* pozycji (departure_dt, linia, kierunek, minuty).
+def prepare(now: datetime):
+    """Zwraca (rows, errors).
+    *rows*   - (label, line, kierunek, min_odjazd, min_wyjście)
+    *errors* - lista komunikatów tekstowych
     """
-    today = current.date()
-    upcoming: list[tuple[datetime, str, str, int]] = []
-    for tstr, direction, line in raw:
-        hh, mm, ss = map(int, tstr.split(":"))
-        dep = datetime.combine(today, time(hh, mm, ss))
-        if dep >= current:
-            minutes = round((dep - current).total_seconds() / 60)
-            upcoming.append((dep, line, direction, minutes))
+    rows: list[Tuple[str, str, str, int, int]] = []
+    errors: list[str] = []
 
-    return sorted(upcoming, key=lambda x: x[0])[:limit]
+    for cfg in STOP_CONFIGS:
+        label = cfg.get("label", cfg["nr"])
+        for line in cfg["lines"]:
+            result = fetch(cfg["id"], cfg["nr"], line)
+            if isinstance(result, str):
+                errors.append(result)
+                continue
+            for dep_dt, ln, direction in result:
+                diff = int((dep_dt - now).total_seconds() // 60)
+                if cfg["hide_before"] < diff <= cfg["horizon"]:
+                    leave_in = diff - cfg["walk"]
+                    rows.append((label, ln, direction, diff, leave_in))
 
-
-def render(
-    board: list[tuple[datetime, str, str, int]],
-    *,
-    font_path: str = FONT_PATH,
-    outfile: Path = OUTPUT_FILE,
-) -> None:
-    """Rysuje tablicę *board* do pliku PNG przyjaznego e-papierowi."""
-    W, H = 648, 480
-    img = Image.new("1", (W, H), 255)  # 1‑bit, białe tło
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.truetype(font_path, 15)
-
-    draw.text((10, 10), "Następne kursy:", font=font, fill=0)
-
-    y = 50
-    for _, line, direction, minutes in board:
-        draw.text((10, y), f"Linia {line:<3} → {direction} za {minutes:>2} min", font=font, fill=0)
-        y += 32
-
-    img.save(outfile)
-    logging.info("Saved preview to %s", outfile)
+    rows.sort(key=lambda r: r[3])  # wg min_odjazd
+    return rows[:10], errors
 
 
-# ---------------------------------------------------------------------------
-# Główna pętla
+def draw(rows, errors):
+    img = Image.new("1", IMG_SIZE, 255)
+    d = ImageDraw.Draw(img)
+    font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
-def main() -> None:
-    clock = now()
-    logging.info("Synchronized time: %s", clock.strftime("%Y-%m-%d %H:%M:%S"))
-
-    raw: List[Tuple[str, str, str]] = []
-    for line in WATCHED_LINES:
-        raw.extend(departures_for(line))
-
-    board = next_departures(raw, current=clock, limit=10)
-
-    if board:
-        render(board)
+    y = 10
+    if errors and not rows:
+        d.text((10, y), "Błędy:", font=font, fill=0)
+        y += 30
+        for msg in errors:
+            d.text((10, y), f"• {msg}", font=font, fill=0)
+            y += 25
     else:
-        logging.warning("No remaining departures for today (%s).", ", ".join(WATCHED_LINES))
+        d.text((10, y), "Najbliższe tramwaje:", font=font, fill=0)
+        y += 40
+        for label, line, direction, mins, leave in rows:
+            txt = f"{label} {line:<2} → {direction:<16} {mins:>2} min wyjście {leave:>2}"
+            d.text((10, y), txt, font=font, fill=0)
+            y += 25
+        if errors:
+            y += 20
+            d.text((10, y), "Błędy (niektóre linie):", font=font, fill=0)
+            y += 25
+            for msg in errors:
+                d.text((10, y), f"• {msg}", font=font, fill=0)
+                y += 25
+    return img
+
+
+def render_to_screen(img):
+    """Stub pod docelowe sterowanie wyświetlaczem e-ink."""
+    # TODO: zaimplementuj integrację z Twoim modułem e-paper.
+    pass
+
+
+def output_image(img):
+    if MODE == "debug":
+        img.save(OUTPUT_FILE)
+    else:
+        render_to_screen(img)
+
+
+def get_now() -> datetime:
+    return datetime.now()
+
+
+def main():
+    now = get_now()
+    rows, errors = prepare(now)
+    img = draw(rows, errors)
+    output_image(img)
 
 
 if __name__ == "__main__":
