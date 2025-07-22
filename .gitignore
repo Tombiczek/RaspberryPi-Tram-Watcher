@@ -6,3 +6,4 @@ ENV/
 
 # Zmienne środowiskowe
 .env
+.kcache

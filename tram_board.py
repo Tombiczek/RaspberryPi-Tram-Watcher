@@ -1,5 +1,12 @@
+"""simple_tram_board.py
+=======================
+E-ink board z odjazdami tramwajów. Dane z API pobierane raz na dobę i cacheowane
+w .kcache/.  Tryb wybiera zmienna TRAM_MODE (debug → PNG, production → render).
+"""
+
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, time
 from pathlib import Path
@@ -9,135 +16,114 @@ import requests
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
-API_URL: str = "https://api.um.warszawa.pl/api/action/dbtimetable_get"
-FONT_PATH: str = "/System/Library/Fonts/SFNS.ttf"
-OUTPUT_FILE: Path = Path("tram_board.png")
-IMG_SIZE = (648, 480)
-FONT_SIZE = 15
+API_URL = "https://api.um.warszawa.pl/api/action/dbtimetable_get"
+FONT_PATH = "/System/Library/Fonts/SFNS.ttf"
+IMG_SIZE = (800, 480)
+FONT_SIZE = 20
+CACHE_DIR = Path(".kcache")
+CACHE_DIR.mkdir(exist_ok=True)
 
-MODE: str = os.getenv("TRAM_MODE", "debug").lower()
+MODE = os.getenv("TRAM_MODE", "debug").lower()
 
-STOP_CONFIGS: list[dict] = [
+STOP_CONFIGS = [
     {
-        "label": "Rondo",      # etykieta na ekranie
-        "id": "5040",         # id słupka ZTM
-        "nr": "07",           # nr przystanku
+        "label": "Rondo",
+        "id": "5040",
+        "nr": "07",
         "lines": ["10", "11"],
-        "horizon": 60,        # ile minut naprzód szukamy
-        "walk": 5,           # czas dojścia na słupek (min)
-        "hide_before": 3,     # kurs znika, gdy zostało ≤ N min
+        "horizon": 60,
+        "walk": 5,
+        "hide_before": 3,
     },
 ]
 
-
 load_dotenv()
-API_KEY: str | None = os.getenv("API_KEY")
-if not API_KEY:
-    API_KEY = ""
+API_KEY = os.getenv("API_KEY", "")
+
+def _cache_path(sid: str, snr: str, line: str, date: str) -> Path:
+    return CACHE_DIR / f"{sid}_{snr}_{line}_{date}.json"
 
 
-def fetch(stop_id: str, stop_nr: str, line: str) -> List[Tuple[datetime, str, str]] | str:
-    """Zwraca listę (datetime, line, kierunek) lub tekst błędu."""
-    params = {
-        "id": "e923fa0e-d96c-43f9-ae6e-60518c9f3238",
-        "busstopId": stop_id,
-        "busstopNr": stop_nr,
-        "line": line,
-        "apikey": API_KEY,
-    }
-    try:
-        data = requests.get(API_URL, params=params, timeout=4).json().get("result", [])
-    except Exception as exc:
-        return f"Błąd sieci {line}@{stop_nr}: {exc}"
-    if isinstance(data, str):
-        return f"Błąd API {line}@{stop_nr}: {data}"
-
+def fetch(sid: str, snr: str, line: str) -> List[Tuple[datetime, str, str]] | str:
     today = datetime.now().date()
+    cfile = _cache_path(sid, snr, line, str(today))
+    if cfile.exists():
+        data = json.loads(cfile.read_text())
+    else:
+        params = {
+            "id": "e923fa0e-d96c-43f9-ae6e-60518c9f3238",
+            "busstopId": sid,
+            "busstopNr": snr,
+            "line": line,
+            "apikey": API_KEY,
+        }
+        try:
+            data = requests.get(API_URL, params=params, timeout=4).json().get("result", [])
+        except Exception as exc:
+            return f"Błąd sieci {line}@{snr}: {exc}"
+        if isinstance(data, str):
+            return f"Błąd API {line}@{snr}: {data}"
+        cfile.write_text(json.dumps(data))
+
     deps: list[Tuple[datetime, str, str]] = []
     for entry in data:
         rec = {i["key"]: i["value"] for i in entry}
         if "czas" in rec and "kierunek" in rec:
             hh, mm, ss = map(int, rec["czas"].split(":"))
             deps.append((datetime.combine(today, time(hh, mm, ss)), line, rec["kierunek"]))
-    return deps or f"Brak danych {line}@{stop_nr}"
+    return deps or f"Brak danych {line}@{snr}"
 
 
 def prepare(now: datetime):
-    """Zwraca (rows, errors).
-    *rows*   - (label, line, kierunek, min_odjazd, min_wyjście)
-    *errors* - lista komunikatów tekstowych
-    """
     rows: list[Tuple[str, str, str, int, int]] = []
     errors: list[str] = []
-
     for cfg in STOP_CONFIGS:
-        label = cfg.get("label", cfg["nr"])
         for line in cfg["lines"]:
-            result = fetch(cfg["id"], cfg["nr"], line)
-            if isinstance(result, str):
-                errors.append(result)
+            r = fetch(cfg["id"], cfg["nr"], line)
+            if isinstance(r, str):
+                errors.append(r)
                 continue
-            for dep_dt, ln, direction in result:
-                diff = int((dep_dt - now).total_seconds() // 60)
+            for dt, ln, dest in r:
+                diff = int((dt - now).total_seconds() // 60)
                 if cfg["hide_before"] < diff <= cfg["horizon"]:
-                    leave_in = diff - cfg["walk"]
-                    rows.append((label, ln, direction, diff, leave_in))
-
-    rows.sort(key=lambda r: r[3])  # wg min_odjazd
+                    rows.append((cfg.get("label", cfg["nr"]), ln, dest, diff, diff - cfg["walk"]))
+    rows.sort(key=lambda r: r[3])
     return rows[:10], errors
 
 
-def draw(rows, errors):
+def draw(rows, err):
     img = Image.new("1", IMG_SIZE, 255)
     d = ImageDraw.Draw(img)
-    font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
-
+    f = ImageFont.truetype(FONT_PATH, FONT_SIZE)
     y = 10
-    if errors and not rows:
-        d.text((10, y), "Błędy:", font=font, fill=0)
-        y += 30
-        for msg in errors:
-            d.text((10, y), f"• {msg}", font=font, fill=0)
+    if err and not rows:
+        d.text((10, y), "Błędy:", font=f, fill=0)
+        for m in err:
             y += 25
+            d.text((10, y), m, font=f, fill=0)
     else:
-        d.text((10, y), "Najbliższe tramwaje:", font=font, fill=0)
-        y += 40
-        for label, line, direction, mins, leave in rows:
-            txt = f"{label} {line:<2} → {direction:<16} {mins:>2} min wyjście {leave:>2}"
-            d.text((10, y), txt, font=font, fill=0)
+        d.text((10, y), "Najbliższe tramwaje:", font=f, fill=0)
+        for lab, ln, dest, mn, lv in rows:
             y += 25
-        if errors:
-            y += 20
-            d.text((10, y), "Błędy (niektóre linie):", font=font, fill=0)
+            d.text((10, y), f"{lab} {ln:<2} → {dest:<16} {mn:>2}m wyjście {lv:>2}", font=f, fill=0)
+        for m in err:
             y += 25
-            for msg in errors:
-                d.text((10, y), f"• {msg}", font=font, fill=0)
-                y += 25
+            d.text((10, y), m, font=f, fill=0)
     return img
 
 
 def render_to_screen(img):
-    """Stub pod docelowe sterowanie wyświetlaczem e-ink."""
-    # TODO: zaimplementuj integrację z Twoim modułem e-paper.
-    pass
+    pass  # TODO
 
 
 def output_image(img):
-    if MODE == "debug":
-        img.save(OUTPUT_FILE)
-    else:
-        render_to_screen(img)
-
-
-def get_now() -> datetime:
-    return datetime.now()
+    (img.save(Path("tram_board.png")) if MODE == "debug" else render_to_screen(img))
 
 
 def main():
-    now = get_now()
-    rows, errors = prepare(now)
-    img = draw(rows, errors)
-    output_image(img)
+    now = datetime.now()
+    rows, err = prepare(now)
+    output_image(draw(rows, err))
 
 
 if __name__ == "__main__":
